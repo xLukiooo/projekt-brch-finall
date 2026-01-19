@@ -1,0 +1,26 @@
+[Unit]
+Description=Gunicorn daemon for Django backend
+After=network.target
+
+[Service]
+Type=notify
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/backend
+EnvironmentFile=/home/ec2-user/backend/.env
+ExecStart=/usr/bin/python3 -m gunicorn \
+    --workers 3 \
+    --bind 0.0.0.0:8000 \
+    --timeout 60 \
+    --access-logfile /var/log/gunicorn/access.log \
+    --error-logfile /var/log/gunicorn/error.log \
+    myproject.wsgi:application
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

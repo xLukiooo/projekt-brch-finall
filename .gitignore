@@ -1,0 +1,97 @@
+# IDE-specific
+.idea/
+.vscode/
+
+# Environments
+.env
+.env.development
+.env.production
+.venv
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+.python-version
+
+# Test & Coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+.hypothesis/
+
+# Translations
+*.mo
+*.pot
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask
+instance/
+.webassets-cache
+
+# Scrapy
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Celery
+celerybeat-schedule
+
+# SageMath
+*.sage.py
+
+# Node.js
+node_modules/
+npm-debug.log
+frontend/build/
+
+# Terraform
+*.tfvars
+terraform.tfstate*
+.terraform/
+.terraform.lock.hcl
+
+architecture_diagram.txt
+.architecture_diagram.txt

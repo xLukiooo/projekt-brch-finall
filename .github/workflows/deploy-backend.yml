@@ -1,0 +1,383 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-backend-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-package:
+    name: Build and Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Build mysqlclient for Amazon Linux 2023
+        run: |
+          cd backend
+          
+          docker run --rm -v $(pwd):/build amazonlinux:2023 bash -c "
+            set -e
+            dnf install -y mariadb105-devel gcc python3-pip python3-devel pkg-config
+            cd /build
+            mkdir -p wheels
+            pip3 wheel mysqlclient --wheel-dir=wheels --no-deps
+            echo 'mysqlclient wheel created:'
+            ls -lh wheels/
+          "
+
+      - name: Install dependencies and create zip artifact
+        run: |
+          cd backend
+          python -m pip install --upgrade pip
+          # Install dependencies from requirements.txt (except mysqlclient) into the current directory
+          grep -v "mysqlclient" requirements.txt > requirements-no-mysql.txt
+          pip install -r requirements-no-mysql.txt --target .
+          # Copy the mysqlclient wheel to the current directory
+          pip install wheels/*.whl --target .
+          # Clean up
+          sudo rm -rf wheels requirements-no-mysql.txt
+          # Create the artifact
+          ls -R
+          zip -r ../backend-artifact.zip *
+          zip -sf ../backend-artifact.zip
+          cd ..
+          
+          if [ ! -f "backend-artifact.zip" ]; then
+            echo "::error::Failed to create deployment artifact"
+            exit 1
+          fi
+          ARTIFACT_SIZE=$(du -h backend-artifact.zip | cut -f1)
+          echo "::notice::Created artifact: backend-artifact.zip (${ARTIFACT_SIZE})"
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-artifact
+          path: backend-artifact.zip
+          retention-days: 7
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-artifact
+
+      - name: Validate Secrets
+        run: |
+          # Sprawdź wymagane sekrety
+          MISSING_SECRETS=()
+          
+          if [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+            MISSING_SECRETS+=("AWS_ACCOUNT_ID")
+          fi
+          if [ -z "${{ secrets.DB_HOST }}" ]; then
+            MISSING_SECRETS+=("DB_HOST")
+          fi
+          if [ -z "${{ secrets.DB_NAME }}" ]; then
+            MISSING_SECRETS+=("DB_NAME")
+          fi
+          if [ -z "${{ secrets.DB_USER }}" ]; then
+            MISSING_SECRETS+=("DB_USER")
+          fi
+          if [ -z "${{ secrets.DB_PASSWORD }}" ]; then
+            MISSING_SECRETS+=("DB_PASSWORD")
+          fi
+          if [ -z "${{ secrets.DJANGO_SECRET_KEY }}" ]; then
+            MISSING_SECRETS+=("DJANGO_SECRET_KEY")
+          fi
+          if [ -z "${{ secrets.FRONTEND_URL }}" ]; then
+            MISSING_SECRETS+=("FRONTEND_URL")
+          fi
+          
+          if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets: ${MISSING_SECRETS[*]}"
+            echo "::error::Please run Terraform workflow first to populate secrets"
+            exit 1
+          fi
+          
+          echo "::notice::All required secrets validated (8 secrets)"
+          
+          # Debug secrets (bez pokazywania wartości)
+          echo "::notice::DB_HOST: ${{ secrets.DB_HOST != '' && '[SET]' || '[EMPTY]' }}"
+          echo "::notice::DB_NAME: ${{ secrets.DB_NAME != '' && '[EMPTY]' || '[EMPTY]' }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/system/GitHubActionsDeployRole
+          role-session-name: gha-deploy-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: us-east-1
+
+      - name: Upload package to S3
+        env:
+          S3_BUCKET_NAME: projekt-brch-codedeploy-artifacts
+        run: |
+          aws s3 cp backend-artifact.zip s3://${S3_BUCKET_NAME}/backend-latest.zip
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to upload artifact to S3 bucket ${S3_BUCKET_NAME}"
+            exit 1
+          fi
+          echo "::notice::Successfully uploaded backend-artifact.zip to S3"
+
+      - name: Get EC2 Instance ID
+        id: get_instance_id
+        run: |
+          # Szukaj EC2 z różnymi możliwymi tagami
+          echo "::notice::Searching for EC2 instance..."
+          
+          # Sprawdź różne możliwe tagi
+          POSSIBLE_TAGS=(
+            "projekt-brch-Backend-EC2"
+            "projekt-brch-backend-instance"
+            "projekt-brch-backend"
+          )
+          
+          INSTANCE_ID=""
+          FOUND_TAG=""
+          
+          for TAG in "${POSSIBLE_TAGS[@]}"; do
+            echo "::notice::Checking for instances with tag: ${TAG}"
+            
+            INSTANCE_ID=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=${TAG}" \
+                        "Name=instance-state-name,Values=running" \
+              --query "Reservations[0].Instances[0].InstanceId" \
+              --output text 2>/dev/null || echo "None")
+            
+            if [ "$INSTANCE_ID" != "None" ] && [ -n "$INSTANCE_ID" ]; then
+              FOUND_TAG="${TAG}"
+              echo "::notice::Found running instance with tag ${TAG}: ${INSTANCE_ID}"
+              break
+            fi
+          done
+          
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No running EC2 instance found with any of these tags:"
+            for TAG in "${POSSIBLE_TAGS[@]}"; do
+              echo "::error::  - ${TAG}"
+            done
+            
+            # Pokazuj wszystkie dostępne instancje
+            echo "::notice::Available EC2 instances:"
+            aws ec2 describe-instances \
+              --query "Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key=='Name'].Value|[0]]" \
+              --output table || echo "Failed to list instances"
+            
+            exit 1
+          fi
+          
+          echo "::notice::Using EC2 instance: ${INSTANCE_ID} (tag: ${FOUND_TAG})"
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Deploy to EC2 via SSM
+        id: send_command
+        run: |
+          # Debug zmiennych środowiskowych (bez pokazywania wartości)
+          echo "::notice::Environment variables check:"
+          echo "::notice::DB_HOST: ${{ secrets.DB_HOST != '' && '[SET]' || '[EMPTY]' }}"
+          echo "::notice::DB_NAME: ${{ secrets.DB_NAME != '' && '[SET]' || '[EMPTY]' }}"
+          echo "::notice::DB_USER: ${{ secrets.DB_USER != '' && '[SET]' || '[EMPTY]' }}"
+          echo "::notice::DB_PASSWORD: ${{ secrets.DB_PASSWORD != '' && '[SET]' || '[EMPTY]' }}"
+          
+          # Utwórz plik JSON z komendami używając jq
+          jq -n \
+            --arg instance_id '${{ steps.get_instance_id.outputs.instance_id }}' \
+            --arg db_host '${{ secrets.DB_HOST }}' \
+            --arg db_name '${{ secrets.DB_NAME }}' \
+            --arg db_user '${{ secrets.DB_USER }}' \
+            --arg db_password '${{ secrets.DB_PASSWORD }}' \
+            --arg django_secret '${{ secrets.DJANGO_SECRET_KEY }}' \
+            --arg frontend_url '${{ secrets.FRONTEND_URL }}' \
+            '{
+              InstanceIds: [$instance_id],
+              DocumentName: "AWS-RunShellScript",
+              Comment: "Deploying backend from GitHub Actions",
+              TimeoutSeconds: 600,
+              Parameters: {
+                commands: [
+                  "#!/bin/bash",
+                  "set -e",
+                  "echo \"=== Backend Deployment Started ===\"",
+                  ("export DB_HOST=" + ($db_host | @sh)),
+                  ("export DB_NAME=" + ($db_name | @sh)),
+                  ("export DB_USER=" + ($db_user | @sh)),
+                  ("export DB_PASSWORD=" + ($db_password | @sh)),
+                  ("export DJANGO_SECRET_KEY=" + ($django_secret | @sh)),
+                  ("export FRONTEND_URL=" + ($frontend_url | @sh)),
+                  "export DB_PORT=\"3306\"",
+                  "",
+                  "echo \"=== Environment Variables Debug ===\"",
+                  "echo \"DB_HOST: [$DB_HOST]\"",
+                  "echo \"DB_NAME: [$DB_NAME]\"",
+                  "echo \"DB_USER: [$DB_USER]\"",
+                  "echo \"DB_PASSWORD: [${DB_PASSWORD:+***}]\"",
+                  "echo \"DJANGO_SECRET_KEY: [${DJANGO_SECRET_KEY:0:10}...]\"",
+                  "",
+                  "# Validation",
+                  "if [[ -z \"$DB_HOST\" ]]; then",
+                  "  echo \"ERROR: DB_HOST is empty!\"",
+                  "  exit 1",
+                  "fi",
+                  "",
+                  "echo \"=== Downloading deployment package ===\"",
+                  "cd /tmp",
+                  "aws s3 cp s3://projekt-brch-codedeploy-artifacts/backend-latest.zip . || {",
+                  "  echo \"ERROR: Failed to download from S3\"",
+                  "  exit 1",
+                  "}",
+                  "",
+                  "echo \"=== Extracting package ===\"",
+                  "unzip -o backend-latest.zip",
+                  "echo \"Files after extraction:\"",
+                  "ls -la",
+                  "",
+                  "echo \"=== Checking deploy script ===\"",
+                  "if [[ ! -f \"deploy-backend.sh\" ]]; then",
+                  "  echo \"ERROR: deploy-backend.sh not found in package\"",
+                  "  echo \"Available files:\"",
+                  "  ls -la",
+                  "  exit 1",
+                  "fi",
+                  "",
+                  "file deploy-backend.sh",
+                  "head -5 deploy-backend.sh",
+                  "chmod +x deploy-backend.sh",
+                  "",
+                  "echo \"=== Starting deployment script ===\"",
+                  "sudo -E bash -x ./deploy-backend.sh"
+                ]
+              }
+            }' > /tmp/ssm-params.json
+          
+          echo "::notice::Created SSM parameters file"
+          
+          # Wyślij komendę do SSM
+          COMMAND_ID=$(aws ssm send-command \
+            --cli-input-json file:///tmp/ssm-params.json \
+            --query 'Command.CommandId' \
+            --output text)
+          
+          if [ -z "$COMMAND_ID" ]; then
+            echo "::error::Failed to send SSM command"
+            exit 1
+          fi
+          
+          echo "::notice::SSM command sent with ID: ${COMMAND_ID}"
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment to complete
+        timeout-minutes: 12
+        run: |
+          echo "::notice::Waiting for deployment command to complete (max 12 minutes)..."
+          
+          MAX_ATTEMPTS=72
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id ${{ steps.send_command.outputs.command_id }} \
+              --instance-id ${{ steps.get_instance_id.outputs.instance_id }} \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+            
+            echo "::notice::Attempt $((ATTEMPT+1))/$MAX_ATTEMPTS - Status: ${STATUS}"
+            
+            if [ "$STATUS" = "Success" ]; then
+              echo "::notice::Deployment completed successfully"
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "::error::Deployment failed with status: ${STATUS}"
+              exit 1
+            fi
+            
+            sleep 10
+            ATTEMPT=$((ATTEMPT+1))
+          done
+          
+          echo "::error::Deployment timed out after waiting 12 minutes"
+          exit 1
+
+      - name: Get deployment status
+        if: always()
+        run: |
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id ${{ steps.send_command.outputs.command_id }} \
+            --instance-id ${{ steps.get_instance_id.outputs.instance_id }} \
+            --query 'Status' \
+            --output text 2>/dev/null || echo "Unknown")
+          
+          echo "::notice::Final deployment status: ${STATUS}"
+          
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id ${{ steps.send_command.outputs.command_id }} \
+            --instance-id ${{ steps.get_instance_id.outputs.instance_id }} \
+            --query 'StandardOutputContent' \
+            --output text 2>/dev/null || echo "No output available")
+          
+          echo "::group::Deployment Output"
+          echo "${OUTPUT}"
+          echo "::endgroup::"
+          
+          if [ "$STATUS" != "Success" ]; then
+            ERROR_OUTPUT=$(aws ssm get-command-invocation \
+              --command-id ${{ steps.send_command.outputs.command_id }} \
+              --instance-id ${{ steps.get_instance_id.outputs.instance_id }} \
+              --query 'StandardErrorContent' \
+              --output text 2>/dev/null || echo "No error output available")
+            
+            echo "::group::Deployment Errors"
+            echo "${ERROR_OUTPUT}"
+            echo "::endgroup::"
+            
+            exit 1
+          fi
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "::notice::==========================================="
+          echo "::notice::  Backend Deployment Completed!"
+          echo "::notice::==========================================="
+          echo "::notice::Region: us-east-1"
+          echo "::notice::S3 Bucket: projekt-brch-codedeploy-artifacts"
+          echo "::notice::EC2 Instance: ${{ steps.get_instance_id.outputs.instance_id }}"
+          echo "::notice::SSM Command ID: ${{ steps.send_command.outputs.command_id }}"
+          echo "::notice::Database: Connected to RDS"
+          echo "::notice::Django: Secret key secured"
+          echo "::notice::==========================================="

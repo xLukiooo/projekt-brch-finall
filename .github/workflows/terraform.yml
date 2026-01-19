@@ -1,0 +1,279 @@
+name: 'Terraform CI/CD'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: 'Terraform'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TF_VAR_my_ip_cidr: ${{ secrets.MY_IP_CIDR }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./terraform
+
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+
+      - name: 'Validate Secrets'
+        run: |
+          if [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ]; then
+            echo "::error::AWS_ACCOUNT_ID secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "::error::PAT_TOKEN secret is not set"
+            echo "::notice::Please create PAT token with 'repo' scope and add as PAT_TOKEN secret"
+            exit 1
+          fi
+          echo "::notice::Required secrets validated"
+
+      - name: 'Configure AWS Credentials'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/system/GitHubActionsTerraformRole'
+          aws-region: us-east-1
+
+      - name: 'Setup Terraform'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - name: 'Terraform Init'
+        run: |
+          terraform init
+          if [ $? -ne 0 ]; then
+            echo "::error::Terraform init failed"
+            exit 1
+          fi
+          echo "::notice::Terraform init completed successfully"
+
+      - name: 'Terraform Validate'
+        run: |
+          terraform validate
+          if [ $? -ne 0 ]; then
+            echo "::error::Terraform validation failed"
+            exit 1
+          fi
+          echo "::notice::Terraform validation passed"
+
+      - name: 'Terraform Format Check'
+        run: |
+          terraform fmt -check -recursive
+          if [ $? -ne 0 ]; then
+            echo "::error::Terraform format check failed. Run 'terraform fmt -recursive' to fix"
+            exit 1
+          fi
+          echo "::notice::Terraform format check passed"
+
+      - name: 'Security Scan'
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: false
+
+      - name: 'Terraform Plan'
+        id: plan
+        run: |
+          terraform plan -out=tfplan -no-color
+          if [ $? -ne 0 ]; then
+            echo "::error::Terraform plan failed"
+            exit 1
+          fi
+          echo "::notice::Terraform plan completed successfully"
+
+      - name: 'Upload Terraform Plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 7
+
+      - name: 'Verify Plan Exists'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          if [ ! -f "tfplan" ]; then
+            echo "::error::Plan file not found"
+            exit 1
+          fi
+          if [ ! -s "tfplan" ]; then
+            echo "::error::Plan file is empty"
+            exit 1
+          fi
+          echo "::notice::Plan file validated successfully"
+
+      - name: 'Terraform Apply'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          terraform apply -auto-approve tfplan
+          if [ $? -ne 0 ]; then
+            echo "::error::Terraform apply failed"
+            exit 1
+          fi
+          echo "::notice::Terraform apply completed successfully"
+
+      - name: 'Update GitHub Secrets from Terraform Outputs'
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          echo "::group::Terraform Outputs (non-sensitive)"
+          terraform output -no-color | grep -v "sensitive"
+          echo "::endgroup::"
+          
+          echo "::notice::Reading Terraform outputs..."
+          
+          # Walidacja PAT tokenu
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::PAT_TOKEN nie jest ustawiony!"
+            echo "::error::Utwórz PAT token z uprawnieniami 'repo' i dodaj jako PAT_TOKEN secret"
+            exit 1
+          fi
+          
+          # --- RDS Database Credentials ---
+          RDS_HOST=$(terraform output -raw rds_host 2>/dev/null || echo "")
+          RDS_DB_NAME=$(terraform output -raw rds_db_name 2>/dev/null || echo "")
+          RDS_DB_USER=$(terraform output -raw rds_db_user 2>/dev/null || echo "")
+          RDS_DB_PASSWORD=$(terraform output -raw rds_db_password 2>/dev/null || echo "")
+          
+          # Mask RDS password in logs
+          if [ -n "$RDS_DB_PASSWORD" ]; then
+            echo "::add-mask::$RDS_DB_PASSWORD"
+          fi
+          
+          # --- Django Secret Key ---
+          DJANGO_SECRET_KEY=$(terraform output -raw django_secret_key 2>/dev/null || echo "")
+          
+          if [ -n "$DJANGO_SECRET_KEY" ]; then
+            echo "::add-mask::$DJANGO_SECRET_KEY"
+          fi
+          
+          # --- Frontend/CloudFront Configuration ---
+          S3_FRONTEND_BUCKET_NAME=$(terraform output -raw s3_frontend_bucket_name 2>/dev/null || echo "")
+          CLOUDFRONT_DISTRIBUTION_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || echo "")
+          FRONTEND_URL=$(terraform output -raw frontend_url 2>/dev/null || echo "")
+          
+          # --- Backend API URL ---
+          BACKEND_API_URL=$(terraform output -raw backend_api_url 2>/dev/null || echo "")
+          
+          # Validate RDS credentials
+          if [ -z "$RDS_HOST" ] || [ -z "$RDS_DB_NAME" ] || [ -z "$RDS_DB_PASSWORD" ]; then
+            echo "::warning::RDS outputs not available - skipping database secrets update"
+            echo "::notice::This is normal on first run or if RDS was not created"
+            RDS_AVAILABLE=false
+          else
+            RDS_AVAILABLE=true
+          fi
+          
+          # Validate Django Secret Key
+          if [ -z "$DJANGO_SECRET_KEY" ]; then
+            echo "::warning::Django Secret Key not available"
+            DJANGO_AVAILABLE=false
+          else
+            DJANGO_AVAILABLE=true
+          fi
+          
+          # Validate Frontend
+          if [ -z "$S3_FRONTEND_BUCKET_NAME" ] || [ -z "$CLOUDFRONT_DISTRIBUTION_ID" ] || [ -z "$FRONTEND_URL" ]; then
+            echo "::warning::Frontend outputs not available - skipping frontend secrets update"
+            FRONTEND_AVAILABLE=false
+          else
+            FRONTEND_AVAILABLE=true
+          fi
+          
+          echo "::notice::Updating GitHub Secrets using PAT_TOKEN..."
+          
+          # Sprawdź czy gh CLI działa z PAT tokenem
+          gh auth status || {
+            echo "::error::GitHub CLI authentication failed with PAT token"
+            echo "::error::Check if PAT_TOKEN has 'repo' scope"
+            exit 1
+          }
+          
+          # --- Django Secret Key ---
+          if [ "$DJANGO_AVAILABLE" = true ]; then
+            echo "::notice::Setting DJANGO_SECRET_KEY..."
+            gh secret set DJANGO_SECRET_KEY --body "$DJANGO_SECRET_KEY" --repo ${{ github.repository }}
+            if [ $? -eq 0 ]; then
+              echo "✓ Set DJANGO_SECRET_KEY"
+            else
+              echo "::error::Failed to set DJANGO_SECRET_KEY"
+              exit 1
+            fi
+          fi
+          
+          # --- RDS Database Secrets ---
+          if [ "$RDS_AVAILABLE" = true ]; then
+            echo "::notice::Setting RDS database secrets..."
+            gh secret set DB_HOST --body "$RDS_HOST" --repo ${{ github.repository }}
+            gh secret set DB_NAME --body "$RDS_DB_NAME" --repo ${{ github.repository }}
+            gh secret set DB_USER --body "$RDS_DB_USER" --repo ${{ github.repository }}
+            gh secret set DB_PASSWORD --body "$RDS_DB_PASSWORD" --repo ${{ github.repository }}
+            echo "✓ Set RDS database secrets (DB_HOST, DB_NAME, DB_USER, DB_PASSWORD)"
+          fi
+          
+          # --- Frontend/CloudFront Secrets ---
+          if [ "$FRONTEND_AVAILABLE" = true ]; then
+            echo "::notice::Setting Frontend secrets..."
+            gh secret set S3_FRONTEND_BUCKET_NAME --body "$S3_FRONTEND_BUCKET_NAME" --repo ${{ github.repository }}
+            gh secret set CLOUDFRONT_DISTRIBUTION_ID --body "$CLOUDFRONT_DISTRIBUTION_ID" --repo ${{ github.repository }}
+            gh secret set FRONTEND_URL --body "$FRONTEND_URL" --repo ${{ github.repository }}
+            echo "✓ Set Frontend secrets (S3_FRONTEND_BUCKET_NAME, CLOUDFRONT_DISTRIBUTION_ID, FRONTEND_URL)"
+          fi
+          
+          # --- Backend API URL ---
+          if [ -n "$BACKEND_API_URL" ]; then
+            echo "::notice::Setting Backend API URL..."
+            gh secret set BACKEND_API_URL --body "$BACKEND_API_URL" --repo ${{ github.repository }}
+            echo "✓ Set BACKEND_API_URL"
+          fi
+          
+          echo "::notice::==========================================="
+          echo "::notice::GitHub Secrets Update Summary:"
+          if [ "$DJANGO_AVAILABLE" = true ]; then
+            echo "::notice::- Django Secret Key: ✓"
+          else
+            echo "::notice::- Django Secret Key: ⊘ (not available)"
+          fi
+          if [ "$RDS_AVAILABLE" = true ]; then
+            echo "::notice::- RDS Database: ✓ (4 secrets)"
+          else
+            echo "::notice::- RDS Database: ⊘ (not available)"
+          fi
+          if [ "$FRONTEND_AVAILABLE" = true ]; then
+            echo "::notice::- Frontend/CloudFront: ✓ (2 secrets)"
+          else
+            echo "::notice::- Frontend/CloudFront: ⊘ (not available)"
+          fi
+          echo "::notice::- All sensitive values masked in logs"
+          echo "::notice::==========================================="
+
+      - name: 'Deployment Summary'
+        if: success()
+        run: |
+          echo "::notice::==========================================="
+          echo "::notice::  Terraform Deployment Completed"
+          echo "::notice::==========================================="
+          echo "::notice::Region: us-east-1 (hardcoded)"
+          echo "::notice::Account: ${{ secrets.AWS_ACCOUNT_ID }}"
+          echo "::notice::All infrastructure secrets stored in GitHub Secrets"
+          echo "::notice::All sensitive values masked in logs"
+          echo "::notice::==========================================="
